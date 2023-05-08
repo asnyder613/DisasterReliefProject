@@ -5,5 +5,6 @@ The purpose of this project is to identify a method for locating displaced perso
 
 After training the models, holdout data was introduced, which contained additional aerial imagery in various .txt files, as well as several image files themselves. After appropriately cleaning and organizing the data in order to identify which columns mapped to Red, Green, and Blue values and labeling the data according to whether the pixel was classified as containing a blue tarp, each selected model was tested on the holdout data in order to confirm its validity for predicting the locations of the blue tarps.
 
-The PDF in this repo is the final report, detailing conclusions as they would be presented to an advisory board. 
+The PDF in this repo is the final report, detailing conclusions as they would be presented to an advisory board.  
+
 The RMarkdown file includes the code referenced in the PDF. 
