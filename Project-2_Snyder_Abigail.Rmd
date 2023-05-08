@@ -1,0 +1,1263 @@
+---
+title: "Disaster Relief Project"
+author: "Abigail Snyder"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: flatly
+    highlight: zenburn
+    toc: yes
+    toc_float: yes
+    df_print: paged
+    code_download: yes
+  pdf_document:
+    toc: yes
+---
+
+```{r setup, , message=FALSE, warning=FALSE, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction  
+
+The purpose of this project is to identify a method for locating displaced persons during a national disaster, such as in the 2010 earthquake in Haiti. The dataset used is the `HaitiPixels.csv` file, which was collected from Haiti shortly following the earthquake. The data contains aerial imagery of Haiti which is separated into Red, Green, and Blue values and categorized by what those pixel groups were identified as (either Vegetation, Rooftop, Blue Tarp, Soil, or Various Non-Tarp). It was known that many of the displaced people were using blue tarps to create shelters, and so the goal of this project is to use the image data in order to predict the locations of the blue tarps.  
+
+First, I installed the necessary packages.  
+```{r, warnings=FALSE, message=FALSE}
+library(tidyverse)
+library(MASS)
+library(e1071)
+library(ISLR2)
+library(class)
+library(ggplot2)
+library(GGally)
+library(ggcorrplot)
+library(caret)
+library(boot)
+library(scales)
+library(ggthemes)
+library(scatterplot3d)
+library(ROCR)
+library(patchwork)
+library(gridExtra)
+library(grid)
+library(readr)
+library(kernlab)
+```
+
+Then, I loaded the dataset from the csv file. The data included four fields, "Class", "Red", "Blue, and "Green." The first column, "Class" indicates the classification of the pixel, while the other three columns indicate the RGB (Red, Blue, Green) color quantities of each pixel. The color values are what will be used as predictors in each of the models.  
+```{r}
+Haiti <- read.csv("HaitiPixels.csv")
+```
+
+Because we are only interested in the location of the blue tarps, we first create a new variable containing only the classification of the blue tarps, called BlueClass, which will serve as our response variable.  
+
+```{r}
+Haiti$BlueClass <- ifelse(Haiti$Class == "Blue Tarp", "Yes", "No")
+Haiti$BlueClass <- factor(Haiti$BlueClass, levels = c("No", "Yes"))
+contrasts(Haiti$BlueClass)
+```
+
+# Exploratory Data Analysis  
+
+Before fitting any kind of models to the data, it is first necessary to get a cursory understanding of the information the data contains. To do that, we will start by exploring some summary information, and then create some visualizations to help us better understand the data.  
+
+```{r}
+summary(Haiti)
+```
+From this initial summary, it appears as if all three colors range from about 44 to 255, with `Blue` having the lowest median value, of 123, as well as the lowest mean, 125. This information may be valuable as the goal of the analysis is to identify where blue tarps are located in order to provide aid. It is also clear that there are far more images without blue tarps than there are images with blue tarps. Images with blue tarps make up only 3% of the total number of images.  
+
+```{r}
+BT <- 61219+2022
+BTperc <- 2022/BT
+```
+
+
+```{r, fig.align = 'center', fig.width = 6}
+pairs(Haiti[2:4],
+      lower.panel = panel.smooth,
+      cex = .5, pch = 24, bg = "light blue")
+```
+
+```{r}
+head(Haiti)
+```
+
+  
+A scatter plot of the colors shows an interesting non-linear correlation between `Blue` and `Red`. Where `Green` and `Red` and `Green` and `Blue` both seem to have similar patterns of correlation, Red and Blue seem to increase parabolicaly, which again, could have interesting connections to the goal of this analysis.  
+
+Before looking at only the image files for blue tarps, I thought it would be interesting to compare the quantities of red, blue, and green values in the various classes. To do that, I modified the dataset to group all data for each class, then sum the total values for each color and display it as a percentage of total image datapoints for that class.  
+
+```{r, warning=FALSE}
+haiti_summarise <- (Haiti[-5]) %>% 
+  group_by(Class) %>% 
+  summarise_all(funs(sum))
+
+haiti_group <- haiti_summarise %>% 
+  mutate(total = Red + Blue + Green) %>% 
+  mutate(Red = round(((Red/total) * 100), digits=2)) %>% 
+  mutate(Blue = round(((Blue/total) * 100), digits=2)) %>% 
+  mutate(Green = round(((Green/total) * 100), digits=2)) 
+
+haiti_group <- subset(haiti_group, select = -c(total))
+haiti_group
+```
+For the images classified as blue tarps, it is evident that there is a significantly higher percentage of blue pixels in each image, than for any of the other classes. Based on this, it should be possible to accurately differentiate which images are of blue tarps and which are not.  
+
+In order to visualize this, we create a bar chart of each class and their respective color values. 
+
+```{r, fig.align = 'center', fig.width = 6}
+DFtall <- data.frame(t(haiti_summarise))
+DFtall <- cbind(Color = rownames(DFtall), DFtall)
+rownames(DFtall) <- 1:nrow(DFtall)
+
+colnames(DFtall) <- c("Color", "Blue Tarp", "Rooftop", "Soil", 
+                      "Various Non-Tarp", "Vegetation")
+DFtall <- DFtall[- 1, ]   
+
+DFgroup <- DFtall %>% 
+  mutate_at(c("Blue Tarp", "Rooftop", "Soil",
+              "Various Non-Tarp", "Vegetation"), as.numeric) %>% 
+  gather(key = Class, value = Value, "Blue Tarp":"Vegetation")
+
+options(scipen = 999)
+ggplot(DFgroup, aes(Class, Value, fill = Color)) + 
+  geom_col(position = "dodge") +
+  labs(title="Distribution of Color by Class",
+       x="Class",
+       y="Pixel Count",
+       fill = "Color") +
+  scale_y_continuous(labels = scales::comma)+
+  theme_fivethirtyeight()+
+  scale_fill_manual(values = c("Red" = "#d7191c", 
+                               "Blue" = "#2c7bb6",
+                               "Green" = "#1a9641"))
+
+```
+
+This bar chart shows a few key details. One, as was previously noted, there are far fewer pixels identified as being blue tarps than there are rooftops, soil, various non-tarp, and vegetation. Too, as noted in the chart above, the pixels identified as blue tarps are the only class where the blue data points are greater than red or green.  
+
+Out of curiosity, we note briefly the frequency of each class:  
+
+```{r, warning=FALSE, fig.align = 'center', fig.width = 6}
+freq <- Haiti %>% 
+  count(Class)
+
+ggplot(data=freq, aes(x=Class, y=n, fill=Class)) + 
+  geom_bar(stat = "identity")+
+  labs(title="Distribution of Classes",
+       x="Class",
+       y="Number of Instances") +
+  scale_y_continuous(labels = scales::comma)+
+  theme_fivethirtyeight()+
+  geom_text(aes(label = scales::comma(n)), size=3, vjust = 2) +
+  scale_fill_manual(values = c("Rooftop" = "#d7191c", 
+                               "Blue Tarp" = "#2c7bb6",
+                               "Vegetation" = "#1a9641",
+                               "Soil" = "#fdae61",
+                               "Various Non Tarp" = "#c2a5cf"))+ 
+  guides(fill = FALSE)
+
+```
+  
+This bar graph quantifies what we noted earlier, the significantly lower frequency of blue tarps to any other class in the images.  
+
+After observing some general trends in the data as a whole, it is time to turn our attention to just the class containing images identified as blue tarps, which we have put into a new variable: `BlueClass`.  
+
+First, we consider the correlation between the three color values.  
+
+```{r, fig.align = 'center', fig.width = 6}
+ggpairs(Haiti, columns = 2:4, aes(color=BlueClass, alpha=.5)) +
+  theme_fivethirtyeight()
+```
+  
+This correlation matrix gives some interesting insight into the color striation in the images classified as having blue tarps. As images begin to have red pixel values over about 200, they are less likely to have blue tarps. There are almost no images with blue tarps that have green or blue pixel values below 100, and images containing a blue value of 200 are more seem to be exclusively classified as containing a blue tarp. 
+
+Finally, for visualization purposes, we fit the data to a 3d scatterplot in order to see how all three colors interact with each other.  
+
+```{r, fig.align = 'center', fig.width = 6}
+#Dr. Gedek suggested the inclusion of a 3D model to confirm
+#results I had gotten in my first logistic model
+
+colors <- c("#d7191c", "#2c7bb6")
+colors <- colors[as.numeric(Haiti$BlueClass)]
+
+
+s3d <- scatterplot3d(Haiti[2:4], 
+                     main="3D Scatterplot of Images",
+              color=colors,
+              pch=20,
+              angle=25,
+              grid=TRUE,
+              box=TRUE)
+
+legend("right", legend = levels(Haiti$BlueClass),
+       col=c("#d7191c", "#2c7bb6"), pch=20)
+```
+  
+This plot is especially revealing. There is a very clear plane separating the images with and without blue tarps based on the amount of red, blue, and green values in each pixel. With this information, we can be confident that it is possible to accurately predict which images will contain blue tarps based on their RGB color values.  
+
+
+# Fitting the Models  
+
+In order to effectively classify the presence of blue tarps, I used the training data to fit several models in R. In the interest of writing clean and easily reproducible code, I created a variable for `set.seed()` to be used when formulating each model, as well as creating a `trainControl()` object to be used on each model. The models were fit using the caret package in R and each model was cross-validated using `k=10` for the training data (and, eventually, the holdout data).  
+
+The goal of developing these algorithms is to be able to predict the location of the blue tarps where people may be stranded and waiting for aid. As such, the response variable is BlueClass, which is a categorical variable of images classified as having or not having a blue tarp, and the predictors are the three color identifiers: "Red", "Blue", and "Green".
+
+For each model type, I will fit one model using just the three predictor variables, as well as a second model using interaction terms between the colors. Comparing these two models may help to identify whether interactions between the colors are useful in identifying the presence of blue tarps.
+
+In evaluating each model, I considered various performance metrics: accuracy, false positive rate, false negative rate, and kappa. When studying imbalanced data such as this, where there are far more observations that are not blue tarps than observations which are blue tarps, Cohen’s Kappa can provide a more realistic view of the model performance than just accuracy. Unfortunately, this metric does not give much data regarding the prediction performance of the models, only compares the observed accuracy of the model with the accuracy that might be observed by chance. Due to the nature of the data, it is possible that a model could always predict either “yes” or “no” and still have an accuracy of over 95%. *(Research on Cohen's Kappa which greatly aided my understanding of this metric: https://thenewstack.io/cohens-kappa-what-it-is-when-to-use-it-and-how-to-avoid-its-pitfalls/)* With the goal of the project in mind, of being able to rescue as many displaced persons as possible (and with no specific limitations on resources or personnel noted), I placed special emphasis on minimizing the false negative rate, while balancing for maximum accuracy, when tuning the thresholds of each model.  
+
+```{r}
+#The idea of setting the seed for reproducibility through multiple
+#analyses: https://www.rpubs.com/christianaaronschroeder/788860
+
+seed = 1
+
+fitControl <- trainControl(method = "cv",
+                           number = 10,
+                           savePredictions = TRUE,
+                           classProbs = TRUE)
+
+```
+
+
+The goal of developing these algorithms is to be able to predict the location of the blue tarps where people may be stranded and waiting for aid. As such, our response variable is `BlueClass`, which is a categorical variable of images classified as having or not having a blue tarp, and our predictors are the three color identifiers: `"Red"`, `"Blue"`, and `"Green"`.  
+
+For each model type, I will fit one model using just the three predictor variables, as well as a second model using interaction terms between the colors. Comparing these two models may help to identify whether interactions between the colors are useful in identifying the presence of blue tarps.  
+
+## Logistic Regression  
+
+### Fitting the Model  
+
+The first model we will fit is a logistic regression model. I fit both models and then compare the summary results, specifically the Accuracy and Kappa metrics, for each model:  
+
+```{r, warning=FALSE}
+set.seed(seed)
+
+log.fit.1 <- train(BlueClass ~ Red + Blue + Green, data = Haiti, 
+                 method = "glm", 
+                 family = "binomial",
+                 trControl = fitControl
+                 )
+
+log.fit.2 <- train(BlueClass ~ Red*Blue*Green, data = Haiti, 
+                 method = "glm", 
+                 family = "binomial",
+                 trControl = fitControl
+                 )
+
+#I borrowed the idea for extracting just the Accuracy 
+#and Kappa Summary Information from 
+# https://www.rpubs.com/christianaaronschroeder/788860 
+
+rbind(c("Model 1",log.fit.1$results[2],log.fit.1$results[3]),
+      c("Model 2",log.fit.2$results[2],log.fit.2$results[3]))
+```
+Having used the `caret` package for training a logistic model, we can see that the results indicate an accuracy of 99.53% and 99.6% respectively, which for most data sets would seem improbable (and is close enough to 1 to trigger a warning message from R). However, considering the visualizations earlier which indicated a clear differentiation between image data with and without blue tarps, it seems probable that a logistic regression would indeed be able to accurately predict the presence of a blue tarp based on image data.  
+
+The accuracy of the model with interaction effects is slightly higher than the model with individual predictors, but both models show extremely strong performance based on accuracy.   
+
+The accuracy of the model with interaction effects is slightly higher than the model with individual predictors, but both models show extremely strong performance based on accuracy. We also note that the Kappa of the first model is .92, and the Kappa of the second model (with interaction terms) is .935, both of which are high, and indicate a strong performance of the models. 
+
+A confusion matrix validates these observations:  
+```{r}
+confusionMatrix.train(log.fit.1)
+confusionMatrix.train(log.fit.2)
+```
+  
+This leads us to the consideration of threshold values in order to fine-tune the models for optimal performance. 
+
+
+### Threshold Evaluation  
+
+The next step in tuning the models is to choose the threshold which produces the highest accuracy for each model. To do that, we can use the `thresholder()` function in the `caret` package, which I put within a function in order to quickly reproduce for each model to be tested. 
+```{r}
+#Inspiration to build a function for threshold testing rather 
+#than reproducing the code for each model:
+#https://www.rpubs.com/christianaaronschroeder/788860 
+
+#Detail and research on thresholder function: 
+#https://rdrr.io/cran/caret/man/thresholder.html 
+
+threshhold <- function(model) {
+  set.seed(seed)
+  thresholdStats <- thresholder(model,
+                                threshold=seq(0.1,.9, 0.1),
+                                final = TRUE, 
+                                statistics = c("Sensitivity", "Specificity",
+                                               "Accuracy", "Kappa",
+                                               "Precision", 
+                                               "Detection Rate"))
+  
+  thresholdStats <- thresholdStats %>% 
+  mutate(falseNeg = 1 - Sensitivity) %>% 
+  mutate(falsePos = 1 - Specificity) 
+  
+  return(thresholdStats)
+}
+
+log1_thresh <- threshhold(log.fit.1)
+
+maxAcc <- log1_thresh %>% 
+  slice_max(Accuracy)
+
+minFNR <- log1_thresh %>% 
+  slice_min(falseNeg)
+
+p1 <- ggplot(log1_thresh, aes(x=prob_threshold, y=falseNeg)) +
+  geom_line() +
+  geom_point(data=minFNR, color="red") +
+  labs(title="Threshold & False Negative")
+
+p2 <- ggplot(log1_thresh, aes(x=prob_threshold, y=Accuracy)) +
+  geom_line() +
+  geom_point(data=maxAcc, color="red") +
+  labs(title="Threshold & Accuracy")
+
+p1+p2
+
+```
+  
+For the first model, the threshold with the highest accuracy is .7. This threshold also gives a sensitivity rate of .998 and specificity of .91. In the case of identifying the images containing blue tarps, it seems most prudent to minimize the false negative rate in order to ensure that as many people as possible receive aid. (However, if there were restraints in budget and/or time, this is something that may need to be reconsidered). Thus, we note that the false negative rate is 0.0015 at a threshold of .7. The plots indicate that a lower threshold would reduce the false negative rate, but that such reduction parallels a reduction in accuracy at lower thresholds. 
+
+It is also worth noting that the range of accuracy throughout the possible threshold values is .990 to .993. At *any* threshold, the model still has an extremely high degree of accuracy!  
+
+```{r, fig.align = 'center', fig.width = 6}
+#run threshold test function on second model
+log2_thresh <- threshhold(log.fit.2)
+
+#extract line with highest Accuracy
+maxAcc <- log2_thresh %>% 
+  slice_max(Accuracy)
+
+#compare with line with lowest FNR
+minFNR <- log2_thresh %>% 
+  slice_min(falseNeg)
+
+p1 <- ggplot(log2_thresh, aes(x=prob_threshold, y=falseNeg)) +
+  geom_line() +
+  geom_point(data=minFNR, color="red") +
+  labs(title="Threshold & False Negative")
+
+p2 <- ggplot(log2_thresh, aes(x=prob_threshold, y=Accuracy)) +
+  geom_line() +
+  geom_point(data=maxAcc, color="red") +
+  labs(title="Threshold & Accuracy")
+
+p1+p2
+```
+  
+For the second model (with interaction terms), the threshold with the highest accuracy is .8. However, much like with Model 1, the range of accuracy values across thresholds is extremely small, indicating that the model performs well at any threshold. Still, we want to maximize accuracy, even if only with minimal gains, so choose .8. This threshold also gives a sensitivity rate of .997 and specificity of .97, which is slightly more balanced than the prior model, but as such, raises the false negative rate slightly. 
+
+Because the false negative rate is lower in the first model (without interaction terms) and the other metrics for model performance change only minimally, the best logistic regression model seems to be the first model, with a threshold of .7.  
+
+### ROC Plot   
+
+We confirm this with a ROC plot:  
+```{r}
+#The idea for creating a function for creating ROC plots for
+#reproducibility: https://www.rpubs.com/christianaaronschroeder/788860 
+
+createROC <- function(model) {
+  set.seed(seed)
+  pred <- predict(model, Haiti, type='prob')
+  predob <- ROCR::prediction(pred$No, 
+                       Haiti$BlueClass, 
+                       label.ordering=c('Yes', 'No'))
+  model.roc <- ROCR::performance(predob, measure='tpr', x.measure='fpr')
+  auc.perf = performance(predob, measure = "auc")
+  auctxt = paste("AUC value:", auc.perf@y.values)
+  
+  ROCplot <- plot(model.roc, 
+                  colorize=T, 
+                  main = toupper(model$method),
+                  sub = auctxt, 
+                  font.sub = 3,
+                  cex.sub=.75,
+                  print.cutoffs.at=c(0.1, 0.5, 0.9),
+                  xlim = c(0, .3), ylim = c(.8, 1)
+                  )
+  lines(x=c(0,1), 
+        y=c(0,1), 
+        col='grey')
+  
+  return(ROCplot)
+}
+
+```
+
+```{r, fig.align = 'center', fig.width = 4, fig.height=4}
+#create ROC plot for logistic model
+log1roc <- createROC(log.fit.1) 
+```
+  
+The strong performance of the logistic model is evident in the ROC plot, as the curve nearly perfectly traces the far upper left reaches of the plot, showing that there is very little difference between .1 and .9 thresholds; all models have a relatively high accuracy and maximize both sensitivity and specificity. We can observe, however, the slight bump in performance right around the .7 mark. The AUC score, printed at the base of the plot, also indicates, in a classification-threshold-invariant way, the high quality of the model's predictions. Because AUC ranges from 0 to 1, an AUC value higher than .99 validates the high level of prediction accuracy that the ROC curve shows.  
+
+### Model Selection  
+
+Because the logistic model without interaction terms performs so strongly, we choose to keep the first logistic model with a threshold of .7 to move forward with our analysis. This model is summarized below:  
+
+```{r}
+log.fit.final <- log1_thresh %>% 
+  slice(7)
+
+log.fit.final
+```
+  
+  
+## LDA (Linear Discriminant Analysis)  
+  
+  
+### Fitting the Model  
+
+Now we will fit an LDA model to the data, and once again create two models: one with interaction terms and one without.  
+
+```{r}
+lda.fit.1 <- train(BlueClass ~ Red + Blue + Green, data = Haiti, 
+                 method = "lda", 
+                 trControl = fitControl
+                 )
+
+lda.fit.2 <- train(BlueClass ~ Red * Blue * Green, data = Haiti, 
+                 method = "lda", 
+                 trControl = fitControl
+                 )
+
+
+rbind(c("Model 1",lda.fit.1$results[2],lda.fit.1$results[3]),
+      c("Model 2",lda.fit.2$results[2],lda.fit.2$results[3]))
+```
+  
+Similarly to the logistic regression, LDA results in a high level of accuracy in both models. In this case, the two models are even closer, varying only by 0.01 in accuracy, though the Kappa of the model with interaction terms does seem to be stronger. Again, we note that this tells us very little about the prediction of the model, considering the strong imbalance of the data. Thus, we proceed with both models and consider improvements that might be made by threshold tuning.
+
+### Threshold Evaluation  
+
+Like before, we will analyze the possible threshold values for each model to help us determine the best possible fit:  
+
+```{r, fig.align = 'center', fig.width = 6}
+#run threshold test function on first model
+lda1_thresh <- threshhold(lda.fit.1)
+
+#extract line with highest Accuracy
+maxAcc <- lda1_thresh %>% 
+  slice_max(Accuracy)
+
+#compare with line with lowest FNR
+minFNR <- lda1_thresh %>% 
+  slice_min(falseNeg)
+
+p1 <- ggplot(lda1_thresh, aes(x=prob_threshold, y=falseNeg)) +
+  geom_line() +
+  geom_point(data=minFNR, color="red") +
+  labs(title="Threshold & False Negative")
+
+p2 <- ggplot(lda1_thresh, aes(x=prob_threshold, y=Accuracy)) +
+  geom_line() +
+  geom_point(data=maxAcc, color="red") +
+  labs(title="Threshold & Accuracy")
+
+p1+p2
+
+```
+  
+For the first model (without interaction terms), 0.1 is clearly the point of lowest false negative rate and highest accuracy.  
+
+```{r, fig.align = 'center', fig.width = 6}
+#run threshold test function on first model
+lda2_thresh <- threshhold(lda.fit.2)
+
+#extract line with highest Accuracy
+maxAcc <- lda2_thresh %>% 
+  slice_max(Accuracy)
+
+#compare with line with lowest FNR
+minFNR <- lda2_thresh %>% 
+  slice_min(falseNeg)
+
+p1 <- ggplot(lda2_thresh, aes(x=prob_threshold, y=falseNeg)) +
+  geom_line() +
+  geom_point(data=minFNR, color="red") +
+  labs(title="Threshold & False Negative")
+
+p2 <- ggplot(lda2_thresh, aes(x=prob_threshold, y=Accuracy)) +
+  geom_line() +
+  geom_point(data=maxAcc, color="red") +
+  labs(title="Threshold & Accuracy")
+
+p1+p2
+```
+  
+The second function (with interaction terms) differs dramatically in threshold value depending on which performance metric is of most interest. The lowest false negative rate is at .1, while the highest accuracy is at .8, with considerable decrease in each when tuning for one or the other. 
+
+Like with the logistic regression models, both LDA models only range in accuracy above .9, which means that our threshold tuning, while improving model performance, does so only minimally.  
+
+Because the second model has almost no false negative rate and an overall higher accuracy compared with the first model, we continue with the second model (with interaction terms) with a threshold of .75 (which maximizes accuracy, while minimizing false negative rate).
+
+```{r}
+confusionMatrix.train(lda.fit.2)
+```
+  
+Here, we see that there is a slightly higher false positive rate from the LDA model as a whole (without the threshold tuning) than there was in the logistic model. The false negative rate is also very slightly higher than the LDA model.  
+
+
+### ROC Plot  
+
+```{r, fig.align = 'center', fig.width = 4, fig.height=4}
+#create ROC plot for lda model
+lda2roc <- createROC(lda.fit.2) 
+```
+  
+The ROC plot for the first LDA model confirms what we identified using `thresholder()` above: that the point with the best balance between sensitivity and specificity is near .7. The graph does appear to indicate that the logistic model has a better fit overall, though tuning the threshold values makes that less relevant to our analysis. The AUC value at the bottom of the plot confirms this, with .98 being slightly lower than the .99 AUC of the logistic regression model.  
+
+
+### Model Selection  
+
+The final LDA model, which is fit with interaction terms and with a threshold of .7 is summarized below:  
+
+```{r}
+lda.fit.final <- lda2_thresh %>% 
+  slice(7)
+
+lda.fit.final
+```
+  
+  
+## QDA (Quadratic Discriminant Analysis)  
+  
+  
+### Fitting the Model  
+
+The next model we will fit to the data is a quadratic model, using QDA. Once again, we will fit two models.  
+
+```{r}
+qda.fit.1 <- train(BlueClass ~ Red + Blue + Green, data = Haiti, 
+                 method = "qda", 
+                 trControl = fitControl
+                 )
+
+qda.fit.2 <- train(BlueClass ~ Red * Blue * Green, data = Haiti, 
+                 method = "qda", 
+                 trControl = fitControl
+                 )
+
+rbind(c("Model 1",qda.fit.1$results[2],qda.fit.1$results[3]),
+      c("Model 2",qda.fit.2$results[2],qda.fit.2$results[3]))
+```
+The first model shows a higher accuracy and Kappa value, indicating that the interaction terms are not as relevant to a QDA model. The results of the first model show an accuracy of 99.46%, which is marginally higher than the previous models.  
+
+In this instance, we will move forward with just the first model, as both accuracy and kappa are higher without interaction terms, thus it seems prudent to keep the simpler model.  
+
+```{r}
+confusionMatrix.train(qda.fit.1)
+```
+  
+From the confusion matrix, it is evident that the model performs well, even without fine-tuning. Still, we will move forward with threshold evaluation to attempt to maximize model performance by minimizing the false negative rate.   
+  
+### Threshold Evaluation  
+
+```{r, fig.align = 'center', fig.width = 6}
+#run threshold test function on model
+qda1_thresh <- threshhold(qda.fit.1)
+
+#extract line with highest Accuracy
+maxAcc <- qda1_thresh %>% 
+  slice_max(Accuracy)
+
+#compare with line with lowest FNR
+minFNR <- qda1_thresh %>% 
+  slice_min(falseNeg)
+
+p1 <- ggplot(qda1_thresh, aes(x=prob_threshold, y=falseNeg)) +
+  geom_line() +
+  geom_point(data=minFNR, color="red") +
+  labs(title="Threshold & False Negative")
+
+p2 <- ggplot(qda1_thresh, aes(x=prob_threshold, y=Accuracy)) +
+  geom_line() +
+  geom_point(data=maxAcc, color="red") +
+  labs(title="Threshold & Accuracy")
+
+p1+p2
+```
+  
+In the case of the QDA model, the threshold with lowest false negative rate is at .1, while the threshold with highest accuracy is .6. If we examine the plots of threshold versus accuracy and false negative rate, it is evident that a threshold of .5 would be an effective compromise between minimizing false negatives and maximizing accuracy. Once again, it is worth noting that the range of values in both accuracy and false negative rates is extremely small, indicating a model with very strong performance even before any kind of tuning.  
+
+### ROC Plot  
+
+```{r, fig.align = 'center', fig.width = 4, fig.height=4}
+#create ROC plot for qda model
+qda1roc <- createROC(qda.fit.1) 
+```
+  
+The appearance of the ROC plot is more similar to the logistic regression model than the LDA model, with the line closely following the upper left reaches of the plot, indicating a high level of accuracy regardless of threshold. The AUC value of .998 confirms.  
+
+One thing to note in the comparison of the QDA and LDA model ROC plots is how the QDA model more closely follows the upper left reaches of the plot than did the LDA model. One explanation for this is the greater flexibility of a QDA decision boundary, which, unlike the linear decision boundary of the LDA model, can bend into quadratic shapes. This increased flexibility is likely part of the reason for the improved performance in the QDA model over the LDA model.  
+
+  
+### Model Selection  
+
+Based on the ROC plot above and the results of the threshold evaluation, the QDA model with the best balance of accuracy and low false negative rate is model 1, with a threshold of .5. 
+
+```{r}
+qda.fit.final <- qda1_thresh %>% 
+  slice(5)
+
+qda.fit.final
+```
+
+
+## KNN (K-nearest neighbor)  
+
+
+### Fitting the Model  
+
+
+Next, we use K-nearest neighbor to fit a model. For the KNN model, I am choosing to fit just one model, without any interaction terms, as the greater variance of the KNN model would become overly complex with the addition of interaction terms. Additionally, the prior models have indicated that adding interaction terms does not necessarily benefit the model's accuracy. 
+
+```{r}
+set.seed(seed)
+knn.fit <- train(BlueClass ~ Red + Blue + Green, data = Haiti, 
+                 method = "knn", 
+                 trControl = fitControl,
+                 preProcess = c("center", "scale"),
+                 tuneLength = 10
+                 )
+knn.fit
+```
+  
+The KNN cross-validation results selected k=7 as the optimal value, giving an accuracy of 99.73%, which is the highest of the models tested thus far. (Interestingly enough, the range of accuracy values seem to only be from 0.9970 to 0.9973, which is *very* tight). When considered in the context of providing aid to those in need, this seems to be a solid option for choosing as our best model to move forwards. 
+
+```{r, fig.align = 'center', fig.width = 4}
+plot(knn.fit, type="b", xlab="K- Value",ylab="Accuracy level", main="K-Value & Accuracy")
+```
+  
+The plot shows clearly that k=7 is a significant improvement in accuracy in comparison to other values of k. As stated before "significant" may be an overstatement when the range of accuracy values is less than 0.001. 
+
+
+### Threshold Evaluation  
+
+
+```{r, fig.align = 'center', fig.width = 6}
+#run threshold test function
+knn_thresh <- threshhold(knn.fit)
+
+#extract line with highest Accuracy
+maxAcc <- knn_thresh %>% 
+  slice_max(Accuracy)
+
+#compare with line with lowest FNR
+minFNR <- knn_thresh %>% 
+  slice_min(falseNeg)
+
+p1 <- ggplot(knn_thresh, aes(x=prob_threshold, y=falseNeg)) +
+  geom_line() +
+  geom_point(data=minFNR, color="red") +
+  labs(title="Threshold & False Negative")
+
+p2 <- ggplot(knn_thresh, aes(x=prob_threshold, y=Accuracy)) +
+  geom_line() +
+  geom_point(data=maxAcc, color="red") +
+  labs(title="Threshold & Accuracy")
+
+p1+p2
+```
+  
+The highest accuracy is at a threshold of .5, which still results in a strong false negative rate for the model. However, in evaluating the plots above, it seems as if choosing a threshold of .4 would be more effective. It would very slightly reduce overall accuracy, but would more significant minimize the false negative rate. 
+
+A confusion matrix which gives an average of the cell counts across resamples confirms that the accuracy of the model, even without any specific tuning, is extremely high. 
+
+```{r}
+confusionMatrix.train(knn.fit)
+```
+  
+  
+### ROC Plot  
+
+```{r, fig.align = 'center', fig.width = 4, fig.height=4}
+#create ROC plot for knn model
+knnroc <- createROC(knn.fit) 
+```
+  
+Similarly to the logistic and QDA models, the ROC curve confirms a strong performance by the KNN model. Notably, the ROC curve comes together at almost a 90-degree angle, which evidences the lack of parabolity in the model. The AUC value of 0.9998 is the highest of any model evaluated thus far.  
+
+
+### Model Selection  
+  
+Based on the threshold evaluation and ROC curve, the KNN model with k=7 and a threshold of 0.4 is the best KNN model for this data.  
+```{r}
+knn.fit.final <- knn_thresh %>% 
+  slice(4)
+
+knn.fit.final
+```
+  
+  
+## Penalized Logistic Regression (elastic net penalty)  
+  
+The next model that we are going to fit to the data is a penalized logistic regression (elastic net penalty) model. To do this, we will use the ridge regression technique. Like with prior models, we will fit two models, one with interaction terms and one without.  
+
+### Fitting the Model  
+  
+```{r, fig.align = 'center', fig.width = 6}
+set.seed(seed)
+lambdaGrid <-expand.grid(alpha = 0, lambda = 10^seq(-4, 2, 0.2))
+
+plr.fit.1 <- train(BlueClass ~ Red + Blue + Green, data = Haiti, 
+                 method = "glmnet", 
+                 tuneGrid=lambdaGrid,
+                 trControl = fitControl
+                 )
+
+plr.fit.2 <- train(BlueClass ~ Red * Blue * Green, data = Haiti, 
+                 method = "glmnet", 
+                 tuneGrid=lambdaGrid,
+                 trControl = fitControl
+                 )
+
+plr.fit.1$results %>% slice_max(Accuracy)
+
+plr.fit.2$results %>% slice_max(Accuracy)
+
+
+plot1 <- ggplot(plr.fit.1) + scale_x_log10() + ggtitle('Model 1')
+plot2 <- ggplot(plr.fit.2) + scale_x_log10() + ggtitle('Model 2')
+grid.arrange(plot1,plot2, ncol=2)
+```
+  
+We start by fitting the models using a cross-validation technique for lambda. For both models, the lambda values with the highest accuracy range from 0.0001 to 0.0039, with a significant decrease in accuracy as lambda increases. It is also worth noting that both the accuracy and the kappa values of the second model (with interaction terms) are higher. With that in mind, we will continue with the second model.  
+  
+  
+### Threshold Evaluation  
+  
+The next step is to evaluate the various thresholds for the model. We start with a confusion matrix:  
+
+```{r}
+confusionMatrix.train(plr.fit.2)
+```
+
+We can see from the confusion matrix that the overall accuracy of the model is over 98%, which is quite strong. This is confirmed when we examine the threshold plots: 
+
+```{r, fig.align = 'center', fig.width = 6}
+#run threshold test function
+plr_thresh <- threshhold(plr.fit.2)
+
+#extract line with highest Accuracy
+maxAcc <- plr_thresh %>% 
+  slice_max(Accuracy)
+
+#compare with line with lowest FNR
+minFNR <- plr_thresh %>% 
+  slice_min(falseNeg)
+
+p1 <- ggplot(plr_thresh, aes(x=prob_threshold, y=falseNeg)) +
+  geom_line() +
+  geom_point(data=minFNR, color="red") +
+  labs(title="Threshold & False Negative")
+
+p2 <- ggplot(plr_thresh, aes(x=prob_threshold, y=Accuracy)) +
+  geom_line() +
+  geom_point(data=maxAcc, color="red") +
+  labs(title="Threshold & Accuracy")
+
+p1 + p2
+```
+  
+Interestingly, the threshold results for the lowest false negative rate are level from 0 all the way though 0.7. The highest accuracy very distinctly comes at a threshold of 0.8, though the range of accuracy is above 0.97 regardless of threshold value. When we dig a little bit deeper, we can see that the sensitivity at a threshold of .8 is still 0.9999, or a 0.000065 false negative rate. Thus, we can feel confident moving forward with a threshold of 0.8.  
+  
+### ROC Plot  
+
+```{r, fig.align = 'center', fig.width = 4, fig.height=4}
+#create ROC plot for plr model
+plrroc <- createROC(plr.fit.2) 
+```
+  
+The ROC plot dips considerably after 0.09, but shows a consistently high level of accuracy at lower thresholds. The AUC of .98 is still high, but somewhat lower than the kNN and logistic models. When we remember that the accuracy of a model classifying all observations as just one class would be at least 95%, the lower accuracy of this model becomes more significant.  
+
+  
+### Model Selection  
+  
+Based on the threshold evaluation and ROC curve, the PLR ridge regression model with interaction terms, a lambda of 0.000398, and a threshold of 0.8 is the  best ridge regression fit for the data.  
+
+```{r}
+plr.fit.final <- plr_thresh %>% 
+  slice(8)
+
+plr.fit.final
+```
+
+
+## Support Vector Machine 
+  
+The final model that we are going to fit to the data is a support vector machine model. Based on our exploratory data analysis, we choose to fit just a linear SVM model, as the data does not appear to follow any kind of polynomial or radial patterns. 
+
+### Fitting the Model  
+  
+```{r, fig.align = 'center', fig.width = 6}
+set.seed(seed)
+
+svm.fit <- train(BlueClass ~ Red + Blue + Green, data = Haiti, 
+                 method = "svmLinear", trControl = fitControl,
+                 preProcess = c("center","scale"),
+                 tuneGrid = expand.grid(C = c(0, 0.01, 0.05, 0.1, 0.25,
+                                              0.5, 0.75, 1, 1.25, 1.5, 
+                                              1.75, 2, 5)))
+
+
+svm.fit
+```
+  
+The cross-validated SVM model with a linear kernel results in an accuracy of 99.55 and kappa of 92.4 with a tuned C value of 1.25. 
+
+### Threshold Evaluation 
+  
+The next step is to evaluate the various thresholds for the model. We start with a confusion matrix:  
+
+```{r}
+confusionMatrix.train(svm.fit)
+```
+  
+We can see from the confusion matrix that the overall accuracy of the model is over 99%, which is quite strong. This is confirmed by the threshold evaluation. 
+
+```{r, fig.align = 'center', fig.width = 6}
+#run threshold test function
+svm_thresh <- threshhold(svm.fit)
+svm_thresh
+
+#extract line with highest Accuracy
+maxAcc <- svm_thresh %>% 
+  slice_max(Accuracy)
+
+#compare with line with lowest FNR
+minFNR <- svm_thresh %>% 
+  slice_min(falseNeg)
+
+p1 <- ggplot(svm_thresh, aes(x=prob_threshold, y=falseNeg)) +
+  geom_line() +
+  geom_point(data=minFNR, color="red") +
+  labs(title="Threshold & False Negative")
+
+p2 <- ggplot(svm_thresh, aes(x=prob_threshold, y=Accuracy)) +
+  geom_line() +
+  geom_point(data=maxAcc, color="red") +
+  labs(title="Threshold & Accuracy")
+
+p1 + p2
+```
+
+Though the graphics may at first glance seem to show a wide gap between minimizing the false negative rate and maximizing accuracy, a glance at the scale shows otherwise. The lowest accuracy reported is 99.4, and the highest false negative rate is 0.0005. In that case, a balance between the two and a threshold of 0.5 seems to be a reasonable compromise. 
+  
+### ROC Plot  
+
+```{r, fig.align = 'center', fig.width = 4, fig.height=4}
+#create ROC plot for plr model
+svmroc <- createROC(svm.fit) 
+```
+  
+The ROC plot shows a consistently high level of accuracy throughout. The AUC of .997 is extremely high.
+
+### Model Selection  
+  
+Based on the threshold evaluation and ROC curve, the SVM model with a linear kernel, cost of 1, and threshold of 0.5 is a strong SVM model fit for the data.
+
+```{r}
+svm.fit.final <- svm_thresh %>% 
+  slice(5)
+
+svm.fit.final
+```
+
+
+  
+# Performance Table  
+
+The next step is to evaluate model performance across each of the various models. From each group of models, I chose the best-performing model and collected those results into a data frame:  
+
+```{r, warning=FALSE}
+compare <- tibble(log.fit.final)
+
+compare <- compare %>% 
+  add_row(lda.fit.final) %>% 
+  add_row(qda.fit.final) %>% 
+  add_column("alpha"=NaN, .before = "parameter") %>% 
+  add_column("lambda"=NaN, .before = "parameter")
+
+compare <- compare %>% 
+  add_row(plr.fit.final)%>% 
+  add_column("k"=NaN, .before = "alpha") %>% 
+  add_column("C"=NaN, .before = "alpha")
+
+compare <- compare %>% 
+  add_row(knn.fit.final) %>% 
+  add_row(svm.fit.final) %>% 
+  add_column("Model"=c("LOG", "LDA", "QDA", "PLR-Ridge", "kNN", "SVM"), 
+             .before = "k") %>% 
+  add_column("Interaction Terms" = c("No", "Yes", "No", "Yes", "No", "No"), .before = "k") %>% 
+  dplyr::select(-parameter)
+
+compare_param <- compare %>% 
+  dplyr::select(-c("Sensitivity", "Specificity", "Accuracy", 
+                   "Kappa", "Precision", "Detection Rate", 
+                   "falseNeg", "falsePos"))
+
+compare_metrics <- compare %>% 
+    dplyr::select(-c("Interaction Terms", "k", "C", "alpha", 
+                   "lambda", "prob_threshold"))
+
+compare_param %>% knitr::kable(digits=4) %>%
+  kableExtra::kable_styling(full_width=FALSE) 
+
+compare_metrics %>% knitr::kable(digits=4) %>%
+  kableExtra::kable_styling(full_width=FALSE) 
+```
+Determining the preferred model requires coming back to our goal of finding blue tarps in the image files in order to provide aid to those in need. As such, if there are no time, personnel, or budget constraints that would require limiting false positive results, it seems as if the preferred model would be one which aims to minimize false negatives while keeping overall accuracy high.  
+
+From the tables above, we can see that Ridge Regression is the model with the lowest false negative, though not the highest accuracy (0.9916). QDA would be the next preferred model, followed by the KNN model, which though it does not have the next-lowest false negative rate, has the highest overall accuracy of any of the models.  
+
+## Model Selection  
+
+Based on the above analysis, it is worthwhile to note that all five models are strong candidates for being able to correctly predict the presence of blue tarps. That being said, with a focus on reducing false negatives in order to ensure that as many people are aided as possible, we recommend the following models (in this order) for use in classifying image files as those containing Blue Tarps and those without Blue Tarps with the purpose of providing aid to those harmed in the disaster in Haiti.  
+
+**1) PLR: Ridge Regression**  
+
+The Ridge Regression model is the first choice of predictive model for this data. To tune this model, we chose a threshold of 0.8, alpha of 0, and lambda of 0.000398. This model was fit using interaction terms. Both accuracy and false negative rate were minimized, with a false negative rate of just 0.0001, and an accuracy over 99%. 
+
+**2) QDA Regression**  
+
+The second choice of model is the QDA regression model without interaction terms with a tuning threshold of 0.5. This model minimizes false negatives (0.0003), and has a very slightly improved accuracy rate from the Ridge Regression model, over 99%. 
+
+**3) K-Nearest Neighbor**  
+
+The third choice of model is the K-Nearest Neighbor (KNN) model. This model was fit without interaction terms and a threshold of 0.4, and though the false negative rate increased somewhat (to 0.0010), the accuracy is the highest of any of the models (99.71%). This model edges out the Logistic Regression Model as my third choice because the overall accuracy of the KNN model is higher, and false positives are significant reduced by the KNN model.  
+  
+I am confident that any of these three models would be effective in identifying blue tarps from image data. 
+  
+
+
+# Holdout Data  
+
+Excluded from the initial data is a holdout data set comprised of seven different files. There are additionally three image files, which were labeled with similar notation as the text files. One of these appeared to be paired with a set of the .txt files, but without advanced image processing capabilities, did not seem to offer any clear insight into the data. Also worth noting is that most of the .txt files appeared to be paired, with file naming identifying both a tarp and non-tarp file for all but one of the files, which was labeled as non-tarp, but did not have a paired tarp file. I chose to include this data anyway, with the consideration that the training data also included far more non-tarp observations than tarp, and that presumably, the same would be true in the holdout data. After making these preliminary decisions, I loaded the data from the .txt files into dataframes, and then combined them.  
+```{r}
+colnames = c("ID", "X", "Y", "Map X", "Map Y", "Lat", "Lon", "B1", "B2", "B3")
+holdout_bluetarp67 <- read_table("orthovnir067_ROI_Blue_Tarps.txt", skip=8, col_names = colnames)
+
+holdout_bluetarp78 <- read_table("orthovnir078_ROI_Blue_Tarps.txt", col_names = colnames, skip = 8)
+
+holdout_bluetarp69 <- read_table("orthovnir069_ROI_Blue_Tarps.txt", col_names = colnames, skip = 8)
+
+holdout_nontarp57 <- read_table("orthovnir057_ROI_NON_Blue_Tarps.txt", col_names = colnames, skip = 8)
+
+holdout_nontarp78 <- read_table("orthovnir078_ROI_NON_Blue_Tarps.txt", col_names = colnames, skip = 8)
+
+holdout_nontarp69 <- read_table("orthovnir069_ROI_NOT_Blue_Tarps.txt", col_names = colnames, skip = 8)
+
+holdout_nontarp67 <- read_table("orthovnir067_ROI_NOT_Blue_Tarps.txt", col_names = colnames, skip = 8)
+
+#combine all tarp values into one dataframe and add class label
+holdout_tarp <- do.call("rbind", list(holdout_bluetarp67, holdout_bluetarp69, holdout_bluetarp78)) %>% 
+  add_column("BlueClass" = "Yes")
+
+#combine all non-tarp values into one dataframe and add class label
+holdout_nontarp <-do.call("rbind", list(holdout_nontarp57, holdout_nontarp78, holdout_nontarp69, holdout_nontarp67)) %>% 
+  add_column("BlueClass" = "No")
+  
+#combine two dataframes & factor class label column
+holdout <- rbind(holdout_tarp, holdout_nontarp)
+holdout$BlueClass <- as.factor(holdout$BlueClass)
+
+```
+
+Before moving on, I made a few basic observations about the holdout data.
+```{r}
+summary(holdout)
+```
+```{r}
+BT <- 1989698+14480
+BTperc <- 14480/BT
+BTperc
+```
+What stands out most from this information is the imbalance of the data. There are 1,989,697  non-tarp observations, and only 14,480 observations that are classified as being blue tarps. This is even more imbalanced than the training data, where approximately 3% of the observations were blue tarps. Here, only 0.7% of the observations are blue tarps. As a result, even a classification model that predicted all of the pixels to be of the same class could be expected to have an accuracy of over 99%.  
+
+Notably, the holdout data is not formatted in the same way as the original data and contains columns labeled B1, B2, and B3 rather than the RGB data columns seen in the training data. The working hypothesis is that these three columns in the holdout data are indeed designating color values within the pixel data, so to test this theory, I compare the distribution between the training and holdout datasets:
+
+```{r}
+holdout_colortestY <- subset(holdout, BlueClass=="Yes")
+(c(mean(holdout_colortestY$B1),mean(holdout_colortestY$B2),mean(holdout_colortestY$B3)))
+```
+```{r}
+training_colortestY <- subset(Haiti, BlueClass=="Yes")
+(c(mean(training_colortestY$Red),mean(training_colortestY$Blue),mean(training_colortestY$Green)))
+```
+
+```{r}
+holdout_colortestN <- subset(holdout, BlueClass=="No")
+(c(mean(holdout_colortestN$B1),mean(holdout_colortestN$B2),mean(holdout_colortestN$B3)))
+```
+
+```{r}
+training_colortestN <- subset(Haiti, BlueClass=="No")
+(c(mean(training_colortestN$Red),mean(training_colortestN$Blue),mean(training_colortestN$Green)))
+```
+
+First, we observe the distribution in training and holdout data sets for the observations labeled as Blue Tarps.  
+```{r}
+par(mfrow=c(2, 3))
+hist(holdout_colortestY$B1, main="Holdout Data: B1", col="gray", border="white", xlim=c(0,255))
+hist(holdout_colortestY$B2, main="Holdout Data: B2", col="gray", border="white", xlim=c(0,255))
+hist(holdout_colortestY$B3, main="Holdout Data: B3", col="gray", border="white", xlim=c(0,255))
+hist(training_colortestY$Red, main="Training Data: Red", col="red", border="white", xlim=c(0,255))
+hist(training_colortestY$Green, main="Training Data: Green", col="green", border="white", xlim=c(0,255))
+hist(training_colortestY$Blue, main="Training Data: Blue", col="blue", border="white", xlim=c(0,255))
+```
+
+Then, we compare the observations that are labeled as non-tarp:  
+```{r}
+par(mfrow=c(2, 3))
+hist(holdout_colortestN$B1, main="Holdout Data: B1", col="gray", border="white", xlim=c(0,255))
+hist(holdout_colortestN$B2, main="Holdout Data: B2", col="gray", border="white", xlim=c(0,255))
+hist(holdout_colortestN$B3, main="Holdout Data: B3", col="gray", border="white", xlim=c(0,255))
+hist(training_colortestN$Red, main="Training Data: Red", col="red", border="white", xlim=c(0,255))
+hist(training_colortestN$Green, main="Training Data: Green", col="green", border="white", xlim=c(0,255))
+hist(training_colortestN$Blue, main="Training Data: Blue", col="blue", border="white", xlim=c(0,255))
+```
+
+The distribution seems to give some potential indication of a correspondence between the Red, Green, and Blue values and the B1, B2, and B3 values in the holdout data set. To confim, we will look at a correlation plot and compare the correlations in each set of data. To bring some clarity to the matrix, we build the graphic for the holdout data set based on a sample of 10% of the holdout data.
+
+```{r}
+par(mfrow=c(2,2))
+ggpairs(Haiti, columns = 2:4, aes(color=BlueClass, alpha=.5)) +
+  theme_fivethirtyeight()
+
+n <- dim(holdout)[1]
+idx <- sample(n, size=n*0.1)
+holdout_sample <- holdout[idx,]
+head(holdout_sample)
+
+ggpairs(holdout_sample, columns = 8:10, aes(color=BlueClass, alpha=.5)) +
+  theme_fivethirtyeight()
+```
+This makes it evident that the B3 band represents Blue. After comparing the mean values of the data, the distribution of the data, and the correlation plots, it seems reasonable to conclude that Red corresponds with the B1 value, and Green with B2. 
+
+After coming to this conclusion, we rename the columns in the holdout data to match the training data, and continue with some exploratory data analysis of the holdout data.
+
+```{r}
+holdout <- holdout %>% 
+  rename('Red'='B1', 'Green'='B2', 'Blue'='B3')
+```
+
+Before moving too deep into the exploratory data analysis, we can first make some observations based on the correlation matrix. Like the training data, for images classified as having blue tarps, and the image begins to have red pixel values over about 200, they are less likely to have blue tarps. There are almost no images with blue tarps that have green or blue pixel values below 100, and images containing a blue value of 200 or more seem to be exclusively classified as containing a blue tarp.
+
+Like the training data, for images classified as having blue tarps, and the image begins to have red pixel values over about 200, they are less likely to have blue tarps. There are almost no images with blue tarps that have green or blue pixel values below 100, and images containing a blue value of 200 or more seem to be exclusively classified as containing a blue tarp. 
+
+Finally, like with the training data, we use a 3D model to observe the separation of color data within each pixel.
+```{r, fig.align = 'center', fig.width = 6}
+#Dr. Gedeck suggested the inclusion of a 3D model to confirm
+#results I had gotten in my first logistic model
+
+colors <- c("#d7191c", "#2c7bb6")
+colors <- colors[as.numeric(holdout$BlueClass)]
+
+
+s3d <- scatterplot3d(holdout[8:10], 
+                     main="3D Scatterplot of Images",
+              color=colors,
+              pch=20,
+              angle=25,
+              grid=TRUE,
+              box=TRUE)
+
+legend("right", legend = levels(holdout$BlueClass),
+       col=c("#d7191c", "#2c7bb6"), pch=20)
+```
+Like the training data, there is a clear delineation between the pixels identified as blue tarps and those labeled as non-tarp in the 3D representation of the pixel color data. 
+
+# Applying the Holdout Data to the Models
+
+Now that we have organized and briefly examined the holdout data it is time to test the performance of each previously constructed model against the holdout data. Once applying the model to the holdout data, I compile the results in a table similar to the performance table given for the training data. 
+
+```{r}
+#The idea for a model test function which calculates the 
+#predictive ability of the selected models against the 
+#holdout data: https://www.rpubs.com/christianaaronschroeder/799196. 
+
+modeltest <- function(model, finalmodel) {
+  
+  set.seed(seed)
+  prob <- predict(model, newdata=holdout, type="prob")
+  pred <- as.factor(ifelse(prob$Yes>finalmodel$prob_threshold, "Yes", "No"))
+  rate <- prediction(prob[,2], holdout$BlueClass)
+  auc <- performance(rate,"auc")
+  
+  conf <- confusionMatrix(pred, holdout$BlueClass)
+  
+  cols <- colnames(finalmodel)
+  
+  Tuning <- NaN
+  Tuning2 <- NaN
+  
+  # tuning
+  for (col in c("alpha","k","mtry","C")) {
+    if(col %in% cols){
+      Tuning <- finalmodel[[col]]
+    }
+  }
+  
+  # tuning2
+  for (col in c("lambda","sigma")) {
+    if(col %in% cols){
+      Tuning2 <- finalmodel[[col]]
+    }
+  }
+  
+  stats <- data.frame(AUROC = auc@y.values[[1]],
+                      Threshold = finalmodel$prob_threshold,
+                      Accuracy = conf$overall[["Accuracy"]],
+                      FalseNeg = 1-conf$byClass[["Sensitivity"]],
+                      FalsePos = 1-conf$byClass[["Specificity"]],
+                      Precision = conf$byClass[["Precision"]],
+                      Tuning = Tuning,
+                      Tuning2 = Tuning2)
+  
+  return(stats)
+}
+
+```
+
+```{r}
+set.seed(seed)
+log.pred <- modeltest(log.fit.1, log.fit.final)
+lda.pred <- modeltest(lda.fit.2, lda.fit.final)
+qda.pred <- modeltest(qda.fit.1, qda.fit.final)
+knn.pred <- modeltest(knn.fit, knn.fit.final)
+plr.pred <- modeltest(plr.fit.2, plr.fit.final)
+svm.pred <- modeltest(svm.fit, svm.fit.final)
+```
+
+### Performance Table (Holdout Data)  
+
+The performance table shows the results of each model as it has been applied to the holdout data, as well as relevant metrics such as accuracy, false positive rate, false negative rate, and any tuning metrics applied. 
+
+```{r}
+hold_compare <- tibble(log.pred)
+
+hold_compare <- hold_compare %>% 
+  add_row(lda.pred) %>% 
+  add_row(qda.pred) %>% 
+  add_row(knn.pred) %>% 
+  add_row(plr.pred) %>% 
+  add_row(svm.pred) %>% 
+  add_column("Model"=c("LOG", "LDA", "QDA", "KNN", "PLR-Ridge", "SVM"), 
+             .before = "AUROC")
+
+hold_compare %>% knitr::kable(digits=4) %>%
+  kableExtra::kable_styling(full_width=FALSE) 
+
+```
+Here, we see the results of each model fitted with the holdout data. Tuning 1 refers to alpha, k, C, or mtry, while Tuning 2 refers to lambda.   
+
+Notably, both the LOG and SVM models have an accuracy of over 0.999. PLR Ridge Regression has a false negative rate of 0, followed closely by QDA and LDA. If we are interested in minimizing false negative rate while also maximizing accuracy, then LDA appears to be the strongest model.  
+
+### ROC Curves  
+Before making our conclusions, it is worth taking a look at the ROC curves for each model once applied to the holdout data. The performance chart above lists the AUROC (area under the ROC Curve) as a means of simple comparison, but seeing the charts themselves can help us to visualize the data.   
+
+```{r}
+createROC_2<- function(model, finalmodel) {
+  set.seed(seed)
+  pred <- predict(model, newdata=holdout, type="prob")
+  predob <- ROCR::prediction(pred$No, 
+                       holdout$BlueClass, 
+                       label.ordering=c('Yes', 'No'))
+  model.roc <- ROCR::performance(predob, measure='tpr', x.measure='fpr')
+  auc.perf = performance(predob, measure = "auc")
+  auctxt = paste("AUC value:", auc.perf@y.values)
+  
+  ROCplot <- plot(model.roc, 
+                  colorize=T, 
+                  main = toupper(model$method),
+                  sub = auctxt, 
+                  font.sub = 3,
+                  cex.sub=.75,
+                  print.cutoffs.at=c(0.1, 0.5, 0.9),
+                  xlim = c(0, .3), ylim = c(.8, 1)
+                  )
+  lines(x=c(0,1), 
+        y=c(0,1), 
+        col='grey')
+  
+  return(ROCplot)
+}
+```
+
+```{r, fig.align = 'center', fig.width = 4, fig.height=4}
+par(mfrow=c(3,2), mar = c(2, 2, 2, 2))
+set.seed(seed)
+
+createROC_2(log.fit.1, log.fit.final)
+createROC_2(lda.fit.2, lda.fit.final)
+createROC_2(qda.fit.1, qda.fit.final)
+createROC_2(knn.fit, knn.fit.final)
+createROC_2(plr.fit.2, plr.fit.final)
+createROC_2(svm.fit, svm.fit.final)
+```
+Here, if we were to compare these ROC curves with those of the models applied to the training data, it is evident that most of the models had a drop in performance. Notably, SVM, LDA, and GLM are still almost completely aligned with the left and upper edges of the graphic, while the other models evidence much more of a slope. One somewhat interesting exception is the kNN model, which seems to indicate a drop in accuracy in comparison to the other models. This observation is reflected in the performance table, where we can note that the AUROC for all six models is over 0.95, which confirms our earlier conclusions regarding the seemingly-impressive accuracy of the models (accuracy that would be indeed impressive if it were not for the imbalanced nature of the data which would allow even a model that assigns ALL pixels to a single class to be accurate approximately 98% of the time).
+
+
+
+# Conclusions
+
+
+### Conclusion 1: Model Selection  
+
+Based on the above analysis, it is worthwhile to note that all five models are effective in correctly predicting the presence of blue tarps. That being said, with a focus on reducing false negatives in order to ensure that as many people are aided as possible, we recommend the following models (in this order) for use in classifying image files as those containing Blue Tarps and those without Blue Tarps with the purpose of providing aid to those harmed in the disaster in Haiti.  
+
+**1) LDA Regression**  
+
+The LDA Regression model is the first choice of predictive model for this data. To tune this model, we chose a threshold of 0.7. It was fit using interaction terms. When tested against the holdout data, accuracy was maximized while also minimizing the false negative rate, with a false negative rate of just 0.0017, and an accuracy of 99.8%. 
+
+**2) QDA Regression**  
+
+The second choice of model is the QDA regression model without interaction terms with a tuning threshold of 0.5. This model minimizes false negatives (0.0018 on the holdout data), and has an only slightly-reduced accuracy rate from the QDA Regression model, still over 99%. 
+
+**3) PLR Ridge Regression**  
+
+The third choice of model is the PLR Ridge Regression model. To tune this model, we chose a threshold of 0.8, alpha of 0, and lambda of 0.000398. This model was fit using interaction terms. Impressively, the PLR Ridge Regression model has a false negative rate of 0. This does slightly decrease accuracy, but only barely, as the accuracy is still 99%. In the event of unlimited resources, a 0% false negative rate would be optimal for ensuring the most possible rescues. However, due to the very slightly reduced accuracy, this is the third choice of model for predicting the presence of blue tarps. 
+  
+Based on the results of testing against the holdout data, I am confident that any of these three models would be effective in identifying blue tarps from image data. 
+
+  
+### Conclusion 2: Imbalanced Data  
+  
+However, we must remember what was noted in the original data analysis: that this data is extremely unbalanced. There are far more image files without blue tarps than there are with blue tarps, so it is possible that a model could always predict either "yes" or "no" and still have an accuracy of over 95%. Because of this, though the accuracy of these models appears to be phenomenal, that should be "taken with a grain of salt."  
+
+Due to the imbalanced nature of the data, I am curious to see how the models perform on the test data set. My inclination is that we will see increased error rates on the testing data due at least in part to the imbalance in the data.  
+
+*This article by Saito & Rehmsmeier (https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4349800/) details how, for imbalanced data sets, ROC plots and AUC scores may not be the best metrics for evaluating model performance. It was outside of my current understanding of the metrics discussed in the article to incorporate them into this project, but I do believe they would be applicable to this data set and may provide additional insights into the performance of the various model.*  
+  
+### Conclusion 3: Project Assumptions  
+  
+The other concern with the data (and really, the premise of the data) is that an assumption is being made that anyone who needs aid has access to a blue tarp (and that the only blue tarps are in locations where people are in need of aid). I would suspect that there are many people in need of aid who do not have a tarp--and that there are many blue tarps in Haiti that are not being used by people in need of assistance. 
+  
+This assumption is in many ways the premise of the project and has severe implications for the application of these models to the actual real-world work of providing aid to people in need. If this assumption turns out to be incorrect, the aid workers may find themselves chasing blue tarps that are in fact just serving as roofing or construction material, while passing by families in need who happen to be huddling under a palm tree rather than a blue tarp.  
+
+### Conclusion 4: Model Tuning  
+
+Additionally, the tuning of the models may need to be refined based on further information from the administration or organization overseeing the rescue operation. As it is, I have tuned the models to minimize false negatives, which inevitably means that there will be at least a minimal increase in false positives. In the context of this project, such false positives may mean wasting time, personnel, and financial resources accessing a location that was wrongly classified as having a blue tarp--and there being no one there to rescue (and no blue tarp). With no data on the budget or time constraints for the rescue, I opted to prioritize the need to help as many people as possible, thus risking the loss of resources on a few false positives, by minimizing the false negatives. This is something that could be refined if there is further information indicating that such resources are of limited supply.  
+
+### Conclusion 5: Application to "Noisier" Environments  
+
+While a blue tarp in a sea of vegetation and soil (the largest class in the data set by far!) seems as if it could potentially be obvious even to an aerial observer, I am curious as to the potential of similar technology applied to more dense suburban and urban areas where a tarp might not be as evident. An image of a sparsely populated area has far less noise than does a busy urban center, especially in many developing countries where blue tarps are routinely used to house homes and cover outdoor markets. In these contexts, I would expect the ability of the models to accurately predict the presence of blue tarps to decline dramatically.  
+
+Along with this, it is worth considering the addition of geospatial influence / data to improve the accuracy of these models in order to reduce the risk of error from noise such as roofs, water features, etc. Perhaps some kind of filtering to identify hue and density could also be effective in improving accuracy. 
+  
+  
+### Conclusion 6: Considerations for Real-World Application
+
+Aside from the already-mentioned influence of limited resources such as finances, time, and personnel, the real-world application of this project is likely to be limited due to other factors. In a rescue situation, such as this one, factors such as access and safety of the rescuers are also important. This data on tarp location may be the first step in carrying out an effective rescue operation, but it would be necessary for rescue teams to evaluate on a much more case-by-case basis whether the operation is actually feasible.   
+
+It is also worth considering other, potentially more effective means of locating displaced persons, such as cell phone location data. During my time living in eastern Africa, the use of cell phones was prolific, with even the most impoverished villagers often owning at least a small flip phone. Unless a storm like the one affecting Haiti had also damaged communications networks, one would think that pinging cell locations might be a more accurate means of locating the presence of displaced people--perhaps even using automated text procedures to get a response from those in need of assistance. 
+
+
+### Conclusion 7: Further Application  
+
+Though my mind is somewhat "stuck" in the application of this project to aid-driven scenarios, such as automating the process of finding boats of refugees lost as sea through continuous geo-scanning (which, if possible, I would hope would be used to provide aid to said refugees rather than imprison or deport them, but that is only my personal view of socioeconomic & global policy), I can only imagine that the applications of such models are somewhat endless with appropriate refinement. I would be curious as to whether a similar concept, applied to temperature scans of the earth, could be used to predict and prevent forest fires. *(After beginning to think outside of just aid work on this topic, I began researching and found the Microsoft Geospatial Research Machine Learning page, which details a number of related projects using machine learning and geospatial imagery to do everything from identify building damage post-earthquake and natural disaster to monitor the melting of the polar ice caps: https://www.microsoft.com/en-us/research/project/geospatial-machine-learning/. I won't reproduce those ideas here, but found them extremely interesting.)*  
+
